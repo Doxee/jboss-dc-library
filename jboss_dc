@@ -1,0 +1,969 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# (c) 2014, Robert Dosen <robert.dosen@gmail.com>
+# (c) 2015, Marco Bazzani <ma.bazzani@gmail.com>
+#
+# JbossAS domain mode management library: plugin ..
+# See http://wildscribe.github.io/Wildfly/8.2.0.Final/index.html 
+# ...
+#
+
+DOCUMENTATION = """
+---
+module: jboss_dc
+short_description: 
+description:
+  - 
+options:
+  name:
+    - Description ...
+requirements:
+  - ...
+author: 
+"""
+
+EXAMPLES = '''
+
+'''
+
+import json
+import urllib2
+import hashlib
+import base64
+
+import mimetypes
+import random
+import string
+import re
+
+debug = True
+jboss_dc_url = 'http://localhost:9990/management/'
+
+
+
+class JbossDomainError(Exception):
+    def __init__(self, message):
+        self.message = message
+    
+class JbossDomain(object):
+                    
+    def __init__(self, module, username, password, jboss_root_dir, profiles,
+                 mod_cluster_settings, server_groups, jboss_applications, tmp_dir, slaves, slave_password):
+        self.module = module
+        self.username = username
+        self.password = password
+        self.jboss_root_dir = jboss_root_dir
+        self.profiles = profiles
+        self.server_groups = server_groups
+        self.mod_cluster_settings = mod_cluster_settings
+        self.jboss_applications = jboss_applications        
+        self.url = jboss_dc_url
+        self.tmp_dir = tmp_dir
+        self.slaves = slaves
+        self.slave_password = slave_password
+        
+        
+        # messaging subsystem
+        self.jms_categories = {
+            'connection_factories': 'connection-factory',
+            'pooled_connection_factories': 'pooled-connection-factory',
+            'queues': 'jms-queue',
+            'topics': 'jms-topic',
+            'password': 'cluster-password',
+        }
+
+        self.facts = {}
+        self.facts['jboss_domain'] = {}
+        self.changed = False
+               
+        # create management user if not already defined
+        self._get_users()
+        if self.username not in self.facts['jboss_domain']['mgmt_users']:
+            self.add_user(self.username, self.password)
+        self._get_config()
+    
+
+    def _url_request(self, operation, post_data={}, address=[], readonly=False):
+        password_manager = urllib2.HTTPPasswordMgrWithDefaultRealm()
+        password_manager.add_password(None, self.url, self.username, self.password)
+
+        auth = urllib2.HTTPDigestAuthHandler(password_manager) 
+        opener = urllib2.build_opener(auth)
+        urllib2.install_opener(opener)
+        
+        json_data = {}
+        json_data['operation'] = operation
+        json_data['address'] = address
+        json_data['json.pretty'] = 1
+        
+        for key in post_data.keys():
+            json_data[key] = post_data[key]
+        if debug:
+            syslog.syslog('jboss_dc _url_request: %s'  % json.dumps(json_data))  
+        
+        if not self.module.check_mode or readonly:
+            try:
+                request = urllib2.Request(self.url, json.dumps(json_data),
+                          headers={'Content-Type': 'application/json'})
+                handler = urllib2.urlopen(request)
+                response = json.loads(handler.read())        
+            except Exception, err:
+                raise JbossDomainError(err)
+
+            return response
+        else:
+            syslog.syslog("would have called: %s with %s" % (self.url, json.dumps(json_data)))
+
+
+    def _post_request(self, filename):
+        if debug:
+            syslog.syslog('jboss_dc post request: %s' % filename)
+        url = self.url + 'add-content'
+        password_manager = urllib2.HTTPPasswordMgrWithDefaultRealm()
+        password_manager.add_password(None, url, self.username, self.password)
+
+        auth = urllib2.HTTPDigestAuthHandler(password_manager) 
+        opener = urllib2.build_opener(auth)
+        urllib2.install_opener(opener)
+
+        try:
+            with open(filename, 'rb') as f:
+                content = f.read()
+            fields = {}
+            files = {'file': {'filename': filename, 'content': content}}
+            data, headers = self._encode_multipart(fields, files)
+            request = urllib2.Request(url, data=data, headers=headers)
+            handler = urllib2.urlopen(request)
+            response = json.loads(handler.read())
+            return response
+
+        except Exception, err:
+            raise JbossDomainError(err)
+
+
+
+    def _encode_multipart(self, fields, files, boundary=None):
+
+        def escape_quote(s):
+            return s.replace('"', '\\"')
+
+        boundary = ''.join(random.choice(string.digits + string.ascii_letters) for i in range(30))
+        lines = []
+
+        for name, value in fields.items():
+            lines.extend((
+                '--{0}'.format(boundary),
+                'Content-Disposition: form-data; name="{0}"'.format(escape_quote(name)),
+                '',
+                str(value),
+            ))
+
+        for name, value in files.items():
+            filename = value['filename']
+            if 'mimetype' in value:
+                mimetype = value['mimetype']
+            else:
+                mimetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+            lines.extend((
+                '--{0}'.format(boundary),
+                'Content-Disposition: form-data; name="{0}"; filename="{1}"'.format(
+                        escape_quote(name), escape_quote(filename)),
+                'Content-Type: {0}'.format(mimetype),
+                '',
+                value['content'],
+            ))
+
+        lines.extend((
+            '--{0}--'.format(boundary),
+            '',
+        ))
+        body = '\r\n'.join(lines)
+
+        headers = {
+            'Content-Type': 'multipart/form-data; boundary={0}'.format(boundary),
+            'Content-Length': str(len(body)),
+        }
+
+        return (body, headers)
+
+
+    def deploy(self, jboss_application, server_group):
+        syslog.syslog("DEBUG: %s %s" % (jboss_application, server_group))
+        if 'deployments' not in self.jboss_applications[jboss_application]:
+            syslog.syslog('ERROR: deployments not in jboss_application configuration')
+            return
+        version = self.jboss_applications[jboss_application]['version']
+        content_dir = '%s/%s/%s/ears/' % (self.tmp_dir, jboss_application, version) 
+
+        for deployment in self.jboss_applications[jboss_application]['deployments']:
+            address = ["server-group", server_group, {"deployment": deployment}]
+ 
+            if deployment in self.facts['jboss_domain']['server_groups'][server_group]['deployments'].keys():
+                current_digest = self.facts['jboss_domain']['server_groups'][server_group]['deployments'][deployment]['hash']
+ 
+                try:                
+                    hasher = hashlib.sha1()
+                    with open(content_dir + deployment, 'rb') as afile:
+                        buf = afile.read(65536)
+                        while len(buf) > 0:
+                            hasher.update(buf)
+                            buf = afile.read(65536)
+                    digest = base64.b64encode(hasher.digest())
+                    if debug:
+                        syslog.syslog('%s %s => %s' % (deployment, current_digest, digest) )
+                    if current_digest == digest: 
+                        continue
+                    else:
+                        self._url_request(operation='remove', address=address)
+                        self._url_request(operation='remove', address=['deployment', deployment])
+                        syslog.syslog("deployment %s changed True" % (deployment,))
+                        self.changed = True
+                except Exception, err:
+                    raise JbossDomainError(err.message)
+            
+            
+            if os.path.isfile(content_dir + deployment):
+                response = self._post_request(content_dir + deployment)
+                bytes_value = response['result']['BYTES_VALUE']
+                syslog.syslog('added content with bytes_value: %s' % bytes_value)
+
+                address = [{"deployment":deployment}]
+                post_data = { "content": [{"hash":{"BYTES_VALUE":bytes_value}}], "enabled":"true" }
+                try:
+                    self._url_request(operation='add',  post_data=post_data, address=address)
+                except Exception, err:
+                    raise JbossDomainError(err)
+
+                address = ['server-group', server_group, {"deployment": deployment}]
+                post_data = { "content": [{"hash":{"BYTES_VALUE":bytes_value}}], "enabled":"true" }
+                self._url_request(operation='add',  post_data=post_data, address=address)
+            
+                # FIXME: Not Idempotent
+                self.changed = True
+            else:
+                msg = "%s not present" % str(content_dir + deployment)
+                raise JbossDomainError(msg)
+
+    def change_jms_cluster_password(self, profile):
+        value = {"EXPRESSION_VALUE":"${jboss.messaging.cluster.password:Ch4ng3d}"}
+        address = ['profile',profile,'subsystem','messaging','hornetq-server', 'default']
+
+        post_data = { 
+                    "name":"cluster-password", 
+                    "value": value
+                    }
+
+        if self.facts['jboss_domain']['profiles'][profile]['messaging'].has_key('cluster-password') and \
+           self.facts['jboss_domain']['profiles'][profile]['messaging']['cluster-password'] == value['EXPRESSION_VALUE']:
+           syslog.syslog("%s do not need password hornetq cluster-password change" % profile )
+           return
+        else:
+            self._url_request(operation='write-attribute',  post_data=post_data, address=address)
+            self.changed = True
+
+
+
+
+
+    def configure_jms(self, jboss_application, profile):
+ 
+
+        if 'messaging' not in self.jboss_applications[jboss_application]: return
+        
+        for jms in self.jboss_applications[jboss_application]['messaging'].keys():
+            if jms == "cluster-password":
+                continue
+                continue
+
+            for item in self.jboss_applications[jboss_application]['messaging'][jms].keys():
+                value = self.jboss_applications[jboss_application]['messaging'][jms][item]
+                address = ['profile',profile,'subsystem','messaging','hornetq-server',
+                           'default',self.jms_categories[jms], item]
+                try:
+                    current_value = self.facts['jboss_domain']['profiles'][profile]['messaging'][jms][item]
+                    if current_value == value:
+                        continue
+                    else:
+                        self._url_request(operation='remove', address=address)
+                except Exception, err:
+                    syslog.syslog("removed unexisting entry: %s" % err)
+
+                post_data = { 
+                    "entries": value,
+                    "connector": {"in-vm" : None}
+                    }
+                if jms in ['connection_factories', 'pooled_connection_factories']:
+                    post_data['connector'] =  {"in-vm" : None}
+
+                self._url_request(operation='add',  post_data=post_data, address=address)
+                self.changed = True
+       
+
+    def configure_mail(self, jboss_application, profile):
+
+         if 'mail' not in self.jboss_applications[jboss_application]: return
+         for protocol in self.jboss_applications[jboss_application]['mail'].keys():
+            for session in self.jboss_applications[jboss_application]['mail'][protocol].keys():
+                value = self.jboss_applications[jboss_application]['mail'][protocol][session]
+                address = ["profile", profile, "subsystem", "mail", "mail-session", session]
+
+                try:
+                    current_value = self.facts['jboss_domain']['profiles'][profile]['mail'][protocol][session]['server'][protocol]
+
+                    d = { 'outbound-socket-binding-ref': current_value['outbound-socket-binding-ref'] }
+
+                    if 'username' in current_value.keys():
+                        d['username'] = current_value['username']
+                        d['password'] = current_value['password']
+
+                    if cmp(current_value, d) == 0:
+                        continue
+
+                    if current_value['outbound-socket-binding-ref'] == value['outbound_socket']:
+                        continue
+                    else:
+                        self._url_request(operation='remove', address=address)
+                except Exception, err:
+                    syslog.syslog("remove unexisting entry: %s" % err) 
+
+                self._url_request(operation='add',  post_data={ "jndi-name": session }, address=address)
+                
+                post_data = { 
+                    "outbound-socket-binding-ref": value['outbound_socket']
+                    }
+
+                if 'username' in value.keys():
+                    post_data['username'] = value['username']
+                    post_data['password'] = value['password']
+
+                address = address + ["server", protocol]
+                self._url_request(operation='add',  post_data=post_data, address=address)
+                self.changed = True
+
+            
+    def add_ds_driver(self, jboss_application, profile, name):
+        value = self.jboss_applications[jboss_application]['datasources']['drivers'][name]
+        address = ['profile',profile,'subsystem','datasources','jdbc-driver', name]
+
+        try:
+            current_value = {
+                "datasource_class": self.facts['jboss_domain']['profiles'][profile]['datasources']['drivers'][name]['datasource_class'],
+                "module": self.facts['jboss_domain']['profiles'][profile]['datasources']['drivers'][name]['module']
+                }
+            if cmp(current_value, value) == 0:
+                return
+            else:
+                self._url_request(operation='remove', address=address)                                       
+        except Exception, err:
+            syslog.syslog("duplicated entry: %s" % err)
+        
+            
+        post_data = { 
+            "driver-name": name,
+            "driver-xa-datasource-class-name": value["datasource_class"],
+            "driver-module-name": value["module"]
+            }
+
+        self._url_request(operation='add',  post_data=post_data, address=address)
+        self.facts['jboss_domain']['profiles'][profile]['datasources']['drivers'][name] = value
+        self.changed = True 
+
+
+
+    def configure_outbound_sockets(self, jboss_application, profile):
+        if 'socket_binding_group' not in self.jboss_applications[jboss_application]: return
+        sockets = self.jboss_applications[jboss_application]['socket_binding_group'].keys()[0]
+
+        for outbound_socket in self.jboss_applications[jboss_application]['socket_binding_group'][sockets]['outbound_sockets']:
+            value = self.jboss_applications[jboss_application]['socket_binding_group'][sockets]['outbound_sockets'][outbound_socket]
+            address = ['socket-binding-group',sockets, 'remote-destination-outbound-socket-binding', outbound_socket] 
+
+            try:
+                d = self.facts['jboss_domain']['profiles'][profile]['socket_binding_group'][sockets]['outbound_sockets'][outbound_socket]
+
+                current_value = {
+                    'host': d['host'],
+                    'port': d['port']
+                }
+
+                if cmp(current_value, value) == 0:
+                    return
+                else:
+                    self._url_request(operation='remove', address=address)                                       
+            except Exception, err:
+                syslog.syslog("delete unexisting entry: %s" % err)
+                
+            post_data = { 
+                "host": value["host"],
+                "port": value["port"]
+                }
+
+            self._url_request(operation='add',  post_data=post_data, address=address)
+        self.changed = True 
+
+
+
+
+
+    def add_xa_datasource(self, jboss_application, profile, name):
+        value = self.jboss_applications[jboss_application]['datasources']['xa_data_sources'][name]
+        address = ['profile',profile,'subsystem','datasources','xa-data-source', name]
+
+        try:
+
+            d = self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][name]
+
+            current_value = {
+                'jndi-name': d['jndi-name'],
+                'driver-name': d['driver-name'],
+                'user': d['user'],
+                'password': d['password'],
+                'url': d['url'],
+                'min-pool-size': d['min-pool-size'],
+                'max-pool-size': d['max-pool-size'],
+                'transaction-isolation': d['transaction-isolation']
+                }
+
+            if cmp(current_value, value) == 0:
+                return
+            else:
+                self._url_request(operation='disable',address=address)
+                self._url_request(operation='remove', address=address)                                       
+        except Exception, err:
+            syslog.syslog("duplicated entry: %s" % err)
+            
+        post_data = { 
+            "jndi-name": value["jndi-name"],
+            "driver-name": value["driver-name"],
+            "enabled": "true",
+            "min-pool-size": value["min-pool-size"],
+            "max-pool-size": value["max-pool-size"],
+            "transaction-isolation": "TRANSACTION_READ_COMMITTED",
+            "no-tx-separate-pool": "true"
+            }
+
+        self._url_request(operation='add',  post_data=post_data, address=address)
+
+        # xa proprietis
+        d = {'user':'User', 'password':'Password', 'url':'URL'}
+        for k in d.keys():
+            attr_address = address + ['xa-datasource-properties', d[k]]
+            post_data = { "value": value[k] }
+            self._url_request(operation='add', post_data=post_data, address=attr_address)
+
+        post_data = { "allow-resource-service-restart": "true" }
+        self._url_request(operation='enable', post_data=post_data, address=address)
+        self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][name] = value
+
+        self.changed = True 
+
+
+    def add_binding(self, jboss_application, profile, name):
+
+        value = self.jboss_applications[jboss_application]['bindings'][name]
+        address = ['profile',profile,'subsystem','naming','binding', name]
+#        if debug:
+#            syslog.syslog(json.dumps(self.facts['jboss_domain']['profiles'][profile]['bindings']))
+        try:
+            current_value = self.facts['jboss_domain']['profiles'][profile]['bindings'][name]
+#            if debug:
+#                syslog.syslog('%s: cur:%s new:%s' % (name, current_value, value))
+            if current_value == value:
+                return
+            else:
+                self._url_request(operation='remove', address=address)                                       
+        except Exception, err:
+            syslog.syslog("duplicated entry: %s" % err)
+            
+        post_data = { "binding-type": 'simple', "value": value }
+        try:
+            self._url_request(operation='add',  post_data=post_data, address=address)
+        except Exception, err:
+            syslog.syslog("error while invoking %s with data %s on operation add" % (address, post_data))
+            
+        self.facts['jboss_domain']['profiles'][profile]['bindings'][name] = value
+
+        self.changed = True
+                
+    def add_ejb3_pool(self, jboss_application, profile, name):
+        value = self.jboss_applications[jboss_application]['ejb3_pools'][name]
+        address = ['profile',profile,'subsystem','ejb3','strict-max-bean-instance-pool', name]
+        
+        try:
+            current_value = self.facts['jboss_domain']['profiles'][profile]['ejb3_pools'][name]
+            if current_value == value:
+                return
+            else:
+                self._url_request(operation='remove', address=address)                                       
+        except Exception, err:
+            syslog.syslog("delete unexisting entry: %s" % err) 
+            
+        post_data = { "timeout-unit": 'MINUTES', "timeout": "5", "max-pool-size": value }
+        self._url_request(operation='add',  post_data=post_data, address=address)
+        self.facts['jboss_domain']['profiles'][profile]['ejb3_pools'][name] = value
+        self.changed = True
+    
+
+    def configure_max_threads(self, jboss_application, profile):
+        if 'max-threads' in self.jboss_applications[jboss_application].keys():
+            value = self.jboss_applications[jboss_application]['max-threads']
+ 
+            try:
+                current_value = self.facts['jboss_domain']['profiles'][profile]['max-threads'] 
+                if current_value == value:
+                    return
+                else:
+                    self._url_request(operation='remove', 
+                                      address=['profile', profile, 'subsystem', 'ejb3', 'thread-pool', 'default', 'max-threads'])
+                    post_data = { "max-threads": value,
+                                  "keepalive-time" : {
+                                    "time" : 100,
+                                    "unit" : "MILLISECONDS"
+                                    },
+                                }
+                    self._url_request(operation='add', post_data=post_data,
+                                      address = ['profile', profile, 'subsystem', 'ejb3', 'thread-pool', 'default'])
+                    self.facts['jboss_domain']['profiles'][profile]['max-threads'] = value
+                    self.changed = True                             
+            except Exception, err:
+                raise JbossDomainError(err)
+
+        # self.changed = True  
+
+    def add_logger_category(self, jboss_application, profile, name):
+
+        value = self.jboss_applications[jboss_application]['logger_category'][name]
+        address = ['profile',profile,'subsystem','logging','logger', name] #todo
+        
+        try:
+            current_value = self.facts['jboss_domain']['profiles'][profile]['logger_category'][name]
+            if current_value == value:
+                return
+            else:
+                self._url_request(operation='remove', address=address)                                       
+        except Exception, err:
+            syslog.syslog("duplicated entry: %s" % err)
+            
+        post_data = { "category": name, "use-parent-handlers": "true", "level": value }
+        self._url_request(operation='add',  post_data=post_data, address=address)
+        self.facts['jboss_domain']['profiles'][profile]['logger_category'][name] = value
+
+        self.changed = True 
+
+
+
+    def add_server_group(self, server_group):
+        address = ['server-group', server_group]
+        post_data = { "profile": self.server_groups[server_group]['profile'],
+                      "socket-binding-group": self.server_groups[server_group]['sockets'] }
+                      
+        self._url_request(operation='add',  post_data=post_data, address=address)
+        # self.facts['jboss_domain']['server_groups'].append(server_group)
+        
+        address = ['server-group', server_group, 'jvm', server_group]
+        post_data = { "heap-size" : self.server_groups[server_group]['jvm']['heap_size'],
+                      "max-heap-size" : self.server_groups[server_group]['jvm']['max_heap_size'],
+                      "permgen-size" : self.server_groups[server_group]['jvm']['permgen_size'],
+                      "max-permgen-size" : self.server_groups[server_group]['jvm']['max_permgen_size'],
+                      "jvm-options": self.server_groups[server_group]['jvm']['options'] }
+        
+        self._url_request(operation='add',  post_data=post_data, address=address) 
+        self.facts['jboss_domain']['server_groups'][server_group] = {}
+        self.facts['jboss_domain']['server_groups'][server_group]['deployments'] = {}
+        self.changed = True
+    
+    
+    def _get_users(self):
+        self.facts['jboss_domain']['mgmt_users'] = []
+        with open(self.jboss_root_dir + '/domain/configuration/' + 'mgmt-users.properties') as f:
+            content = f.readlines()
+        for line in content:
+            li=line.strip()
+            if not li.startswith('#'):
+                try:
+                    user=li.split('=')[0]
+                    self.facts['jboss_domain']['mgmt_users'].append(user)
+                except Exception, err:
+                    raise JbossDomainError(err)
+    
+    def add_user(self, username, password, application=False):
+        username = username.replace('-', '0')
+        try:
+            if application:
+                cmd = '%s/bin/add-user.sh -a -s -u %s -p %s' % (self.jboss_root_dir, username, password)
+            else:
+                cmd = '%s/bin/add-user.sh -s -u %s -p %s' % (self.jboss_root_dir, username, password)
+            
+            if not self.module.check_mode:
+                syslog.syslog(cmd)
+                rc, out, err = self.module.run_command(cmd)
+                if err:
+                    raise JbossDomainError(err)
+
+                self.facts['jboss_domain']['mgmt_users'].append(username)
+                if debug:
+                    syslog.syslog('jboss_dc mgmt_users: %s'  % (str(self.facts['jboss_domain']['mgmt_users'])))
+                    syslog.syslog('jboss_dc add-user out: %s'  % out)
+                    syslog.syslog('jboss_dc add-user err: %s'  % err)
+            else:
+                syslog.syslog("would have called: %s" % cmd )
+
+            self.changed = True        
+        except Exception, err:
+            raise JbossDomainError(err)
+
+    
+    def configure_slave_users(self):
+        syslog.syslog(str(self.facts['jboss_domain']['mgmt_users']))
+        for slave in self.slaves:
+            short_name = slave.split('.')[0]
+            if short_name not in self.facts['jboss_domain']['mgmt_users']:
+                self.add_user(short_name, self.slave_password)
+                self.changed = True
+        self._get_config()
+
+    def add_profile(self, profile, template):
+        try:
+            if debug:
+                syslog.syslog('jboss_dc adding profile %s'  % profile)
+            cmd = '%s/bin/profilecloner2.sh %s %s' % (self.jboss_root_dir, profile, template)
+
+            if not self.module.check_mode:
+                rc, out, err = self.module.run_command(cmd)
+            else:
+                syslog.syslog("would have called: %s" % (cmd))
+
+            if template != 'full-ha':  # work-aound profile-cloner bug
+                address = ['profile', profile, 'subsystem', 'modcluster']
+                self._url_request(operation='remove', address=address)
+
+                address = ['profile', profile, 'subsystem', 'messaging', 'hornetq-server', 'default', 'cluster-connection', 'my-cluster']
+                post_data = { }
+                self._url_request(operation='remove',  post_data=post_data, address=address)
+
+            address = ['profile', profile, 'subsystem', 'webservices']
+            post_data = { 'name':'wsdl-host', 'value':'jbossws.undefined.host' }
+            self._url_request(operation='write-attribute',  post_data=post_data, address=address)
+
+            self._get_config()
+
+            self.changed = True
+        except Exception, err:
+            raise JbossDomainError(err)
+
+    def add_mod_cluster(self, profile):
+        syslog.syslog("adding mod_cluster to profile %s" % profile)
+        if not self.facts['jboss_domain']['profiles'][profile].has_key('modcluster'):
+            syslog.syslog("ignoring profile %s from mod_cluster configuration" % profile)
+            return
+
+
+        proxy_list =self.mod_cluster_settings['web_servers']
+        apache_settings = self.mod_cluster_settings['apache_settings']
+        if self.facts['jboss_domain']['profiles'][profile]['modcluster']:
+            current_config = self.facts['jboss_domain']['profiles'][profile]['modcluster']['configuration']
+            overwrite = False
+            
+            #syslog.syslog(current_config['proxy-list'] +  ":" + str(apache_settings['port']) +" : "+ current_config['proxy-list'].split(',')[0].split(':')[1])
+            #syslog.syslog(apache_settings['advertise_key'] +"^^"+ current_config['advertise-security-key'])
+            #syslog.syslog(apache_settings['balancername'] +"___"+ current_config['balancer'])
+            #syslog.syslog(apache_settings['advertise_group'] +"==="+ current_config['load-balancing-group'])
+
+            if current_config['proxy-list'] and str(apache_settings['port']) != current_config['proxy-list'].split(',')[0].split(':')[1]:
+                overwrite = True
+            if apache_settings['advertise_key'] != current_config['advertise-security-key']:
+                overwrite = True
+            if apache_settings['balancername'] != current_config['balancer']:
+                overwrite = True
+            if apache_settings['advertise_group'] != current_config['load-balancing-group']:
+                overwrite = True
+            
+            for host in proxy_list:
+                if not current_config['proxy-list']:
+                    overwrite = True
+                    break
+                if host not in current_config['proxy-list']:
+                    overwrite = True
+                    break
+        else:
+            overwrite = True
+
+        if overwrite:
+            address = ["profile", profile, "subsystem", "modcluster", "mod-cluster-config", "configuration"]
+            post_data = {
+                "proxy-list":  ",".join([ ":".join([c,str(  apache_settings['port'] )]) for c in proxy_list]),
+                "connector": "ajp",
+                "advertise-socket": "modcluster",
+                "balancer": apache_settings['balancername'],
+                "load-balancing-group": apache_settings['advertise_group'],
+                "advertise-security-key": apache_settings['advertise_key'],
+            }
+
+            self._url_request(operation="remove", address= address, post_data=post_data)
+            self._url_request(operation="add", address= address, post_data=post_data)
+            address = ["profile", profile, "subsystem", "modcluster", "mod-cluster-config", "configuration", "dynamic-load-provider", "configuration", "load-metric" ]
+            post_data = {
+                "type":"busyness"    
+            }
+            self._url_request(operation="add", address= address, post_data=post_data)
+            self.changed = True
+        
+
+
+    def remove_profile(self, profile):
+        subsystems = self.current_config['result']['profile'][profile]['subsystem'].keys()
+        for subsystem in subsystems:
+            address = ['profile', profile, 'subsystem', subsystem]
+            self._url_request(operation='remove', address=address)
+                    
+        self._url_request(operation='remove', address=['profile', profile])
+        # del self.facts['jboss_domain']['profiles'][profile]
+        self.changed = True
+
+    def _get_config(self):
+        post_data = {"recursive":"true"}
+    
+        self.current_config =  self._url_request(operation='read-resource', post_data=post_data, readonly=True)
+        self.facts['jboss_domain']['profiles'] = {}
+        for profile in self.current_config['result']['profile'].keys():
+            self.facts['jboss_domain']['profiles'][profile] = {}
+        
+        self.facts['jboss_domain']['server_groups'] = {}
+        for server_group in self.current_config['result']['server-group']:
+             self.facts['jboss_domain']['server_groups'][server_group] = {}
+
+        self.facts['jboss_domain']['socket_binding_group'] = self.current_config['result']['socket-binding-group'].keys()        
+        
+
+        for profile in self.facts['jboss_domain']['profiles'].keys():
+            # binding
+            self.facts['jboss_domain']['profiles'][profile]['bindings'] = {}
+            if self.current_config['result']['profile'][profile]['subsystem']['naming']['binding']:
+                current_bindings = self.current_config['result']['profile'][profile]['subsystem']['naming']['binding']
+                for binding in current_bindings.keys():
+                    self.facts['jboss_domain']['profiles'][profile]['bindings'][binding] = current_bindings[binding]['value']
+            
+            # mod cluster
+            self.facts['jboss_domain']['profiles'][profile]['modcluster'] = {}
+            if self.current_config['result']['profile'][profile]['subsystem'].has_key('modcluster'):
+                current_modcluster = self.current_config['result']['profile'][profile]['subsystem']['modcluster']
+                for params in current_modcluster.keys():
+                    self.facts['jboss_domain']['profiles'][profile]['modcluster'] = current_modcluster[params]
+
+            # logging subsystem
+            self.facts['jboss_domain']['profiles'][profile]['logger_category'] = {}
+            current_loggers = self.current_config['result']['profile'][profile]['subsystem']['logging']['logger']
+            for logger in current_loggers.keys():
+                self.facts['jboss_domain']['profiles'][profile]['logger_category'][logger] = current_loggers[logger]['level']
+
+            # datasource subsystem
+            self.facts['jboss_domain']['profiles'][profile]['datasources'] = {}
+            self.facts['jboss_domain']['profiles'][profile]['datasources']['drivers'] = {}
+            current_drivers = self.current_config['result']['profile'][profile]['subsystem']['datasources']['jdbc-driver']
+            for driver in current_drivers.keys():
+                self.facts['jboss_domain']['profiles'][profile]['datasources']['drivers'][driver] = {
+                    'module': current_drivers[driver]['driver-module-name'],
+                    'datasource_class': current_drivers[driver]['driver-xa-datasource-class-name']
+                    }
+
+            
+            self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'] = {}
+            current_xa_datasources = self.current_config['result']['profile'][profile]['subsystem']['datasources']['xa-data-source']
+            if current_xa_datasources:
+                for xa_ds in current_xa_datasources.keys():
+                    self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][xa_ds] = {
+                        'jndi-name': current_xa_datasources[xa_ds]['jndi-name'],
+                        'driver-name': current_xa_datasources[xa_ds]['driver-name'],
+                        'min-pool-size': current_xa_datasources[xa_ds]['min-pool-size'],
+                        'max-pool-size': current_xa_datasources[xa_ds]['max-pool-size'],
+                        'transaction-isolation': current_xa_datasources[xa_ds]['transaction-isolation']
+                        }
+
+                    if current_xa_datasources[xa_ds]['xa-datasource-properties']:
+                        try:
+                            self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][xa_ds]['user'] = \
+                                current_xa_datasources[xa_ds]['xa-datasource-properties']['User']['value']
+                            self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][xa_ds]['password'] = \
+                                current_xa_datasources[xa_ds]['xa-datasource-properties']['Password']['value']
+                            self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][xa_ds]['url'] = \
+                                current_xa_datasources[xa_ds]['xa-datasource-properties']['URL']['value']
+                        except Exception:
+                            self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][xa_ds]['user'] = None
+                            self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][xa_ds]['password'] = None
+                            self.facts['jboss_domain']['profiles'][profile]['datasources']['xa_data_sources'][xa_ds]['url'] = None
+
+            self.facts['jboss_domain']['profiles'][profile]['messaging'] = {}
+            for jms in self.jms_categories.keys():
+                self.facts['jboss_domain']['profiles'][profile]['messaging'][jms] = {}
+
+                if self.current_config['result']['profile'][profile]['subsystem'].has_key('messaging'):
+                    current_jms_config = \
+                        self.current_config['result']['profile'][profile]['subsystem']\
+                        ['messaging']['hornetq-server']['default'][self.jms_categories[jms]]
+                    
+                    if isinstance(current_jms_config, dict):
+                        for item in current_jms_config.keys():
+                            if isinstance(current_jms_config[item], dict):
+                                self.facts['jboss_domain']['profiles'][profile]['messaging'][jms][item] = current_jms_config[item]['entries']
+                            elif current_jms_config.has_key("EXPRESSION_VALUE"):
+                                self.facts['jboss_domain']['profiles'][profile]['messaging']['cluster-password'] = current_jms_config["EXPRESSION_VALUE"]
+        
+            # outbound sockets
+            for jboss_application in self.jboss_applications.keys():
+                if 'socket_binding_group' not in self.facts['jboss_domain']['profiles'][profile].keys():
+                    self.facts['jboss_domain']['profiles'][profile]['socket_binding_group'] = {}
+                if self.jboss_applications[jboss_application]['server_group'] == profile:
+                    if 'socket_binding_group' in self.jboss_applications[jboss_application].keys():
+                        sockets = self.jboss_applications[jboss_application]['socket_binding_group'].keys()[0]
+                        if sockets not in  self.facts['jboss_domain']['profiles'][profile]['socket_binding_group'].keys():
+                            self.facts['jboss_domain']['profiles'][profile]['socket_binding_group'][sockets] = {}
+                            self.facts['jboss_domain']['profiles'][profile]['socket_binding_group'][sockets]['outbound_sockets'] = {}
+                        current_sockets = self.current_config['result']['socket-binding-group'][sockets]['remote-destination-outbound-socket-binding']
+                        for current_socket in current_sockets.keys():
+                            # syslog.syslog(json.dumps(current_sockets[current_socket]))
+                            self.facts['jboss_domain']['profiles'][profile]['socket_binding_group'][sockets]['outbound_sockets'][current_socket] = {
+                                'host': current_sockets[current_socket]['host'],
+                                'port': current_sockets[current_socket]['port']
+                            }
+
+            # mail
+            self.facts['jboss_domain']['profiles'][profile]['mail'] = {}
+            for protocol in ['smtp', 'pop3']:
+                self.facts['jboss_domain']['profiles'][profile]['mail'][protocol] = {}
+                current_mail_config = \
+                    self.current_config['result']['profile'][profile]['subsystem']\
+                    ['mail']['mail-session']
+
+                for session in current_mail_config.keys():
+                    #syslog.syslog(json.dumps(current_mail_config[session]))
+                    if protocol in current_mail_config[session]['server'].keys():
+                        self.facts['jboss_domain']['profiles'][profile]['mail'][protocol][session] = \
+                            current_mail_config[session]
+
+             # ejb3 pool
+            self.facts['jboss_domain']['profiles'][profile]['ejb3_pools'] = {}
+            if self.current_config['result']['profile'][profile]['subsystem']['ejb3']['strict-max-bean-instance-pool']:
+                current_pools = self.current_config['result']['profile'][profile]['subsystem']['ejb3']['strict-max-bean-instance-pool']
+                for pool in current_pools.keys():
+                    self.facts['jboss_domain']['profiles'][profile]['ejb3_pools'][pool] = current_pools[pool]['max-pool-size']
+             # max-threads
+            self.facts['jboss_domain']['profiles'][profile]['max-threads'] = {}
+            if self.current_config['result']['profile'][profile]['subsystem']['ejb3']['thread-pool']:
+                current_threads = self.current_config['result']['profile'][profile]['subsystem']['ejb3']['thread-pool']['default']['max-threads']
+                self.facts['jboss_domain']['profiles'][profile]['max-threads'] = current_threads
+
+            # deployments
+            for server_group in self.facts['jboss_domain']['server_groups'].keys():
+                current_deployment = {}
+                self.facts['jboss_domain']['server_groups'][server_group]['deployments'] = {}
+                if self.current_config['result']['server-group'][server_group]['deployment']:
+                    for deployment in self.current_config['result']['server-group'][server_group]['deployment'].keys():
+                        current_deployment[deployment] = {
+                            'name': deployment,
+                            'runtime-name': self.current_config['result']['server-group'][server_group]['deployment'][deployment]['runtime-name'],
+                            'hash': self.current_config['result']['deployment'][deployment]['content'][0]['hash']['BYTES_VALUE']
+                        }
+                        self.facts['jboss_domain']['server_groups'][server_group]['deployments'][deployment] = current_deployment[deployment]
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            username=dict(required=True, type='str'),
+            password=dict(required=True, type='str'),
+            mod_cluster_settings=dict(required=True, type='dict'),
+            jboss_root_dir=dict(required=True, type='str'),
+            profiles=dict(required=True, type='dict'),
+            server_groups=dict(required=True, type='dict'),
+            jboss_applications=dict(required=True, type='dict'),
+            tmp_dir=dict(required=True, type='str'),
+            slaves=dict(required=True, type='list'),
+            slave_password=dict(required=True, type='str'),
+            jboss_application_filter=dict(required=False, type='str')
+            
+            ),
+        supports_check_mode=True,
+    )
+    
+    username = module.params['username']
+    password = module.params['password']
+    jboss_root_dir = module.params['jboss_root_dir']
+    profiles = module.params['profiles']
+    server_groups = module.params['server_groups']
+    jboss_applications = module.params['jboss_applications']
+    tmp_dir = module.params['tmp_dir']
+    slaves = module.params['slaves']
+    slave_password = module.params['slave_password']
+    mod_cluster_settings = module.params['mod_cluster_settings']
+    jboss_application_filter = module.params['jboss_application_filter']
+    
+    jboss_domain = JbossDomain(module, username, password, jboss_root_dir, profiles, mod_cluster_settings, server_groups,
+                               jboss_applications, tmp_dir, slaves, slave_password)
+
+    for profile in jboss_domain.profiles:
+        if profile not in jboss_domain.facts['jboss_domain']['profiles'].keys():
+            template = jboss_domain.profiles[profile]
+            jboss_domain.add_profile(profile, template)
+        jboss_domain.add_mod_cluster(profile)
+
+    for server_group in jboss_domain.server_groups:
+        if server_group not in jboss_domain.facts['jboss_domain']['server_groups'].keys():
+            jboss_domain.add_server_group(server_group)
+
+    jboss_domain.configure_slave_users()
+    
+    failed = {}
+    for application in jboss_applications:
+        if jboss_application_filter:
+            match = re.compile(jboss_application_filter)
+            if not match.match(application):
+                syslog.syslog('excluding: jboss_application %s since not match %s regexp' % (application, jboss_application_filter))
+                continue
+
+        server_group = jboss_applications[application]['server_group']
+        profile = jboss_domain.server_groups[server_group]['profile']
+        
+        if jboss_applications[application].has_key('bindings'):
+            for binding in jboss_applications[application]['bindings']:
+                jboss_domain.add_binding(application, profile, binding)
+        
+        if 'ejb3_pools' in jboss_applications[application].keys():
+            for pool in jboss_applications[application]['ejb3_pools']:
+                jboss_domain.add_ejb3_pool(application, profile, pool)
+        
+        if 'logger_category' in jboss_applications[application].keys():
+            for logger in jboss_applications[application]['logger_category']:
+                jboss_domain.add_logger_category(application, profile, logger)
+        
+        if jboss_applications[application].has_key('datasources'):
+            for ds_driver in jboss_applications[application]['datasources']['drivers']:
+                jboss_domain.add_ds_driver(application, profile, ds_driver)
+        
+            for xa_ds in jboss_applications[application]['datasources']['xa_data_sources']:
+                jboss_domain.add_xa_datasource(application, profile, xa_ds)
+        
+        jboss_domain.change_jms_cluster_password(profile)
+        jboss_domain.configure_jms(application, profile)
+        jboss_domain.configure_outbound_sockets(application, profile)
+
+        jboss_domain.configure_mail(application, profile)
+        jboss_domain.configure_max_threads(application, profile)
+        try:
+            jboss_domain.deploy(application, server_group)
+        except JbossDomainError, ex:
+            try:
+                module.fail_json(msg=ex.message)
+            except Exception, err:
+                syslog.syslog('%s aaa'  % err)  
+
+    jboss_domain._get_config()
+
+    module.exit_json(
+        changed=jboss_domain.changed,
+        ansible_facts=jboss_domain.facts,
+    )
+
+
+from ansible.module_utils.basic import *
+main()
